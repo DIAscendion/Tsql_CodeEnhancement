@@ -1,0 +1,607 @@
+=============================================
+Author: Ascendion AAVA
+Date:
+Description: Technical specification for integrating homepage tile and interstitial event source tables into the existing analytics data pipeline and target model.
+=============================================
+
+# Technical Specification for Homepage Tile and Interstitial Events Enhancement
+
+## Introduction
+
+This document defines the technical specification for onboarding the new source tables provided in the repository inputs into the existing data pipeline and analytical data models.
+
+### Objective
+- Integrate new event sources related to homepage tile activity and interstitial engagement.
+- Align source metadata with the existing source and target models.
+- Define code-level changes, model changes, and source-to-target mapping rules.
+
+### In-Scope Inputs Reviewed
+- `Input/SourceDDL.sql`
+- `Input/SOURCE_TILE_METADATA.sql`
+- `Input/branch_operational_details.sql`
+
+### Notes on Context Availability
+- JIRA story file and Confluence context file were referenced in the request but were not present in the repository path provided.
+- This specification is therefore based on the available SQL artifacts and inferred integration patterns.
+
+## Code Changes
+
+### 1. Impacted Source Objects
+Based on the supplied DDL, the following new or related source objects must be incorporated:
+- `analytics_db.SOURCE_HOME_TILE_EVENTS`
+- `analytics_db.SOURCE_INTERSTITIAL_EVENTS`
+- `analytics_db.SOURCE_TILE_METADATA`
+- `BRANCH_OPERATIONAL_DETAILS` (available input, but no direct relationship to tile events is defined in the DDL)
+
+### 2. Required T-SQL / ELT Changes
+Because the source DDL uses `USING DELTA` syntax, the implementation appears lakehouse-oriented. If the downstream serving layer is SQL Server/T-SQL based, the following code changes are required in the integration layer.
+
+#### 2.1 Landing / Staging Ingestion Scripts
+Create or update ingestion scripts to load the new source tables into staging tables.
+
+Recommended staging tables:
+- `stg.SourceHomeTileEvents`
+- `stg.SourceInterstitialEvents`
+- `stg.SourceTileMetadata`
+
+Example pseudocode:
+```sql
+-- Pseudocode for incremental load into staging
+INSERT INTO stg.SourceHomeTileEvents
+(
+    EventId,
+    UserId,
+    SessionId,
+    EventTs,
+    TileId,
+    EventType,
+    DeviceType,
+    AppVersion,
+    LoadDtm
+)
+SELECT
+    src.event_id,
+    src.user_id,
+    src.session_id,
+    src.event_ts,
+    src.tile_id,
+    src.event_type,
+    src.device_type,
+    src.app_version,
+    SYSUTCDATETIME()
+FROM ext.SourceHomeTileEvents src
+WHERE src.event_ts > @LastSuccessfulEventTs;
+```
+
+#### 2.2 Transformation Stored Procedure
+Create or update a transformation stored procedure to standardize source records and derive reusable business attributes.
+
+Recommended object:
+- `etl.usp_Load_FactTileEngagement`
+
+Core logic:
+- Deduplicate by `event_id`
+- Normalize event type values
+- Join tile metadata by `tile_id`
+- Derive event date key from `event_ts`
+- Map boolean flags to integer indicators where target model requires numeric flags
+
+Example T-SQL snippet:
+```sql
+;WITH HomeEvents AS
+(
+    SELECT
+        h.EventId,
+        h.UserId,
+        h.SessionId,
+        h.EventTs,
+        CAST(h.EventTs AS date) AS EventDate,
+        h.TileId,
+        UPPER(LTRIM(RTRIM(h.EventType))) AS EventType,
+        h.DeviceType,
+        h.AppVersion,
+        ROW_NUMBER() OVER (PARTITION BY h.EventId ORDER BY h.EventTs DESC) AS rn
+    FROM stg.SourceHomeTileEvents h
+),
+FilteredHomeEvents AS
+(
+    SELECT *
+    FROM HomeEvents
+    WHERE rn = 1
+)
+SELECT
+    fhe.EventId,
+    fhe.UserId,
+    fhe.SessionId,
+    fhe.EventTs,
+    CONVERT(int, CONVERT(char(8), fhe.EventDate, 112)) AS EventDateKey,
+    fhe.TileId,
+    tm.TileName,
+    tm.TileCategory,
+    CASE
+        WHEN fhe.EventType = 'TILE_VIEW' THEN 1
+        ELSE 0
+    END AS TileViewCount,
+    CASE
+        WHEN fhe.EventType = 'TILE_CLICK' THEN 1
+        ELSE 0
+    END AS TileClickCount,
+    fhe.DeviceType,
+    fhe.AppVersion
+FROM FilteredHomeEvents fhe
+LEFT JOIN stg.SourceTileMetadata tm
+    ON fhe.TileId = tm.TileId;
+```
+
+#### 2.3 Merge Logic into Target Fact Table
+Add merge/upsert logic into the analytical target fact table.
+
+Recommended object:
+- `etl.usp_Merge_FactTileEngagement`
+
+Example snippet:
+```sql
+MERGE dbo.FactTileEngagement AS tgt
+USING dbo.vw_TileEngagement_Transformed AS src
+    ON tgt.EventId = src.EventId
+WHEN MATCHED THEN
+    UPDATE SET
+        tgt.UserId = src.UserId,
+        tgt.SessionId = src.SessionId,
+        tgt.EventTs = src.EventTs,
+        tgt.EventDateKey = src.EventDateKey,
+        tgt.TileId = src.TileId,
+        tgt.TileName = src.TileName,
+        tgt.TileCategory = src.TileCategory,
+        tgt.TileViewCount = src.TileViewCount,
+        tgt.TileClickCount = src.TileClickCount,
+        tgt.DeviceType = src.DeviceType,
+        tgt.AppVersion = src.AppVersion,
+        tgt.LastUpdatedDtm = SYSUTCDATETIME()
+WHEN NOT MATCHED THEN
+    INSERT
+    (
+        EventId,
+        UserId,
+        SessionId,
+        EventTs,
+        EventDateKey,
+        TileId,
+        TileName,
+        TileCategory,
+        TileViewCount,
+        TileClickCount,
+        DeviceType,
+        AppVersion,
+        CreatedDtm,
+        LastUpdatedDtm
+    )
+    VALUES
+    (
+        src.EventId,
+        src.UserId,
+        src.SessionId,
+        src.EventTs,
+        src.EventDateKey,
+        src.TileId,
+        src.TileName,
+        src.TileCategory,
+        src.TileViewCount,
+        src.TileClickCount,
+        src.DeviceType,
+        src.AppVersion,
+        SYSUTCDATETIME(),
+        SYSUTCDATETIME()
+    );
+```
+
+#### 2.4 Interstitial Event Processing
+Create processing logic for interstitial events, either as a separate fact table or as additional measures in the same engagement fact if the target reporting model is consolidated.
+
+Recommended object:
+- `etl.usp_Load_FactInterstitialEngagement`
+
+Business logic:
+- `interstitial_view_flag` -> interstitial impression count
+- `primary_button_click_flag` -> primary CTA click count
+- `secondary_button_click_flag` -> secondary CTA click count
+- Enrich by `tile_id` using tile metadata
+
+Example transformation snippet:
+```sql
+SELECT
+    i.EventId,
+    i.UserId,
+    i.SessionId,
+    i.EventTs,
+    CONVERT(int, CONVERT(char(8), CAST(i.EventTs AS date), 112)) AS EventDateKey,
+    i.TileId,
+    tm.TileName,
+    tm.TileCategory,
+    CASE WHEN ISNULL(i.InterstitialViewFlag, 0) = 1 THEN 1 ELSE 0 END AS InterstitialViewCount,
+    CASE WHEN ISNULL(i.PrimaryButtonClickFlag, 0) = 1 THEN 1 ELSE 0 END AS PrimaryButtonClickCount,
+    CASE WHEN ISNULL(i.SecondaryButtonClickFlag, 0) = 1 THEN 1 ELSE 0 END AS SecondaryButtonClickCount
+FROM stg.SourceInterstitialEvents i
+LEFT JOIN stg.SourceTileMetadata tm
+    ON i.TileId = tm.TileId;
+```
+
+#### 2.5 View Changes
+Create or modify semantic views used by reporting/consumption layers.
+
+Recommended views:
+- `dbo.vw_TileEngagement_Transformed`
+- `dbo.vw_InterstitialEngagement_Transformed`
+- `dbo.vw_TileEngagementDailySummary`
+
+Possible summary view logic:
+```sql
+CREATE VIEW dbo.vw_TileEngagementDailySummary
+AS
+SELECT
+    EventDateKey,
+    TileId,
+    TileName,
+    TileCategory,
+    SUM(TileViewCount) AS TotalTileViews,
+    SUM(TileClickCount) AS TotalTileClicks,
+    SUM(InterstitialViewCount) AS TotalInterstitialViews,
+    SUM(PrimaryButtonClickCount) AS TotalPrimaryClicks,
+    SUM(SecondaryButtonClickCount) AS TotalSecondaryClicks
+FROM dbo.FactTileEngagement
+GROUP BY
+    EventDateKey,
+    TileId,
+    TileName,
+    TileCategory;
+```
+
+#### 2.6 SQL Agent / Orchestration Changes
+Update orchestration to include:
+- Source extraction step for `SOURCE_HOME_TILE_EVENTS`
+- Source extraction step for `SOURCE_INTERSTITIAL_EVENTS`
+- Metadata load step for `SOURCE_TILE_METADATA`
+- Transformation and merge steps for target fact/dim tables
+- Dependency sequencing so metadata loads complete before fact enrichment
+
+Recommended job flow:
+1. Load tile metadata staging
+2. Load home tile event staging
+3. Load interstitial event staging
+4. Transform event data
+5. Merge into target fact table(s)
+6. Refresh reporting views / aggregates
+7. Audit and reconciliation logging
+
+#### 2.7 Audit and Error Handling
+Enhance ETL logging for:
+- Source row counts
+- Rejected rows due to null/invalid keys
+- Duplicate `event_id`
+- Missing tile metadata matches
+
+Example pattern:
+```sql
+INSERT INTO etl.JobAudit
+(
+    JobName,
+    StepName,
+    RowsProcessed,
+    RowsRejected,
+    AuditDtm
+)
+VALUES
+(
+    'TileEngagementLoad',
+    'LoadFactTileEngagement',
+    @RowsProcessed,
+    @RowsRejected,
+    SYSUTCDATETIME()
+);
+```
+
+### 3. Functional Change Summary
+- Add ingestion of tile event and interstitial event source tables.
+- Add metadata enrichment from tile metadata source.
+- Add new fact-level measures for views, clicks, and CTA interactions.
+- Add deduplication and incremental loading based on event timestamp and event identifier.
+- Add reconciliation and data quality checks.
+
+## Data Model Updates
+
+### 1. Source Model Changes
+
+#### 1.1 New Source Tables Identified
+
+##### `analytics_db.SOURCE_HOME_TILE_EVENTS`
+| Column | Source Type | Target-Compatible SQL Server Type | Notes |
+|---|---|---|---|
+| event_id | STRING | NVARCHAR(100) | Business key / event identifier |
+| user_id | STRING | NVARCHAR(100) | User identifier |
+| session_id | STRING | NVARCHAR(100) | Session identifier |
+| event_ts | TIMESTAMP | DATETIME2(3) | Event timestamp |
+| tile_id | STRING | NVARCHAR(100) | Tile reference |
+| event_type | STRING | NVARCHAR(50) | Expected values: TILE_VIEW, TILE_CLICK |
+| device_type | STRING | NVARCHAR(50) | Device/channel |
+| app_version | STRING | NVARCHAR(50) | Application version |
+
+##### `analytics_db.SOURCE_INTERSTITIAL_EVENTS`
+| Column | Source Type | Target-Compatible SQL Server Type | Notes |
+|---|---|---|---|
+| event_id | STRING | NVARCHAR(100) | Business key / event identifier |
+| user_id | STRING | NVARCHAR(100) | User identifier |
+| session_id | STRING | NVARCHAR(100) | Session identifier |
+| event_ts | TIMESTAMP | DATETIME2(3) | Event timestamp |
+| tile_id | STRING | NVARCHAR(100) | Tile reference |
+| interstitial_view_flag | BOOLEAN | BIT | Boolean indicator |
+| primary_button_click_flag | BOOLEAN | BIT | Boolean indicator |
+| secondary_button_click_flag | BOOLEAN | BIT | Boolean indicator |
+
+##### `analytics_db.SOURCE_TILE_METADATA`
+| Column | Source Type | Target-Compatible SQL Server Type | Notes |
+|---|---|---|---|
+| tile_id | STRING | NVARCHAR(100) | Primary business key |
+| tile_name | STRING | NVARCHAR(255) | Friendly tile name |
+| tile_category | STRING | NVARCHAR(100) | Functional grouping |
+| is_active | BOOLEAN | BIT | Active flag |
+| updated_ts | TIMESTAMP | DATETIME2(3) | Last update timestamp |
+
+#### 1.2 Existing Input Table with No Direct Join Defined
+##### `BRANCH_OPERATIONAL_DETAILS`
+This table is present in the input set but no foreign key, branch identifier, or shared domain attribute exists in the tile event DDL. No direct integration is proposed unless business requirements later define a branch-level relationship.
+
+### 2. Proposed Target Model Changes
+
+Because existing target model details were not supplied, the following target updates are proposed as a standard dimensional model extension.
+
+#### 2.1 New Dimension: `dbo.DimTile`
+Purpose:
+- Store descriptive tile attributes for conformed reporting
+
+Suggested structure:
+```sql
+CREATE TABLE dbo.DimTile
+(
+    TileKey            INT IDENTITY(1,1) PRIMARY KEY,
+    TileId             NVARCHAR(100) NOT NULL,
+    TileName           NVARCHAR(255) NULL,
+    TileCategory       NVARCHAR(100) NULL,
+    IsActive           BIT NULL,
+    SourceUpdatedTs    DATETIME2(3) NULL,
+    EffectiveStartDtm  DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    EffectiveEndDtm    DATETIME2(3) NULL,
+    IsCurrent          BIT NOT NULL DEFAULT 1,
+    CONSTRAINT UQ_DimTile_TileId_IsCurrent UNIQUE (TileId, IsCurrent)
+);
+```
+
+Recommended indexes:
+- Unique index on `(TileId, IsCurrent)`
+- Nonclustered index on `TileCategory`
+
+#### 2.2 New Fact Table: `dbo.FactTileEngagement`
+Purpose:
+- Store atomic or near-atomic engagement events for homepage tiles and interstitial actions
+
+Suggested structure:
+```sql
+CREATE TABLE dbo.FactTileEngagement
+(
+    FactTileEngagementKey      BIGINT IDENTITY(1,1) PRIMARY KEY,
+    EventId                    NVARCHAR(100) NOT NULL,
+    UserId                     NVARCHAR(100) NULL,
+    SessionId                  NVARCHAR(100) NULL,
+    EventTs                    DATETIME2(3) NOT NULL,
+    EventDateKey               INT NOT NULL,
+    TileKey                    INT NULL,
+    TileId                     NVARCHAR(100) NULL,
+    TileName                   NVARCHAR(255) NULL,
+    TileCategory               NVARCHAR(100) NULL,
+    DeviceType                 NVARCHAR(50) NULL,
+    AppVersion                 NVARCHAR(50) NULL,
+    TileViewCount              INT NOT NULL DEFAULT 0,
+    TileClickCount             INT NOT NULL DEFAULT 0,
+    InterstitialViewCount      INT NOT NULL DEFAULT 0,
+    PrimaryButtonClickCount    INT NOT NULL DEFAULT 0,
+    SecondaryButtonClickCount  INT NOT NULL DEFAULT 0,
+    CreatedDtm                 DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    LastUpdatedDtm             DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT UQ_FactTileEngagement_EventId UNIQUE (EventId)
+);
+```
+
+Recommended foreign keys:
+- `TileKey` -> `dbo.DimTile(TileKey)`
+- `EventDateKey` -> `dbo.DimDate(DateKey)` if a date dimension exists
+
+Recommended indexes:
+- Unique index on `EventId`
+- Nonclustered index on `(EventDateKey, TileKey)`
+- Nonclustered index on `(UserId, SessionId)`
+
+### 3. Logical Data Model Diagram
+```text
+SOURCE_HOME_TILE_EVENTS -----------+
+                                    \
+                                     >--- FactTileEngagement --- DimDate
+SOURCE_INTERSTITIAL_EVENTS --------+/             |
+                                                  |
+SOURCE_TILE_METADATA -------------------------- DimTile
+
+BRANCH_OPERATIONAL_DETAILS (no confirmed relationship in current scope)
+```
+
+### 4. Data Quality and Constraint Rules
+- `event_id` must be unique per source table.
+- `tile_id` should match a record in `SOURCE_TILE_METADATA`; unmatched records should be allowed but logged.
+- `event_ts` must not be null for fact loading.
+- `event_type` should be restricted to known values for home tile events.
+- Boolean flags should default to `0` when null in the target measures.
+
+## Source-to-Target Mapping
+
+### 1. Mapping Approach
+A consolidated target fact is proposed to support both home tile events and interstitial actions. Tile metadata will be loaded into `DimTile` and/or denormalized onto the fact as needed for reporting performance.
+
+### 2. Mapping Table for `DimTile`
+
+| Source Table | Source Column | Target Table | Target Column | Transformation Rule (T-SQL) | Notes |
+|---|---|---|---|---|---|
+| SOURCE_TILE_METADATA | tile_id | dbo.DimTile | TileId | `LTRIM(RTRIM(tile_id))` | Natural business key |
+| SOURCE_TILE_METADATA | tile_name | dbo.DimTile | TileName | `NULLIF(LTRIM(RTRIM(tile_name)), '')` | Blank to null |
+| SOURCE_TILE_METADATA | tile_category | dbo.DimTile | TileCategory | `NULLIF(LTRIM(RTRIM(tile_category)), '')` | Standardized category |
+| SOURCE_TILE_METADATA | is_active | dbo.DimTile | IsActive | `CAST(ISNULL(is_active, 0) AS BIT)` | Default inactive when null |
+| SOURCE_TILE_METADATA | updated_ts | dbo.DimTile | SourceUpdatedTs | `CAST(updated_ts AS DATETIME2(3))` | Source update timestamp |
+
+### 3. Mapping Table for `FactTileEngagement` from Home Tile Events
+
+| Source Table | Source Column | Target Table | Target Column | Transformation Rule (T-SQL) | Notes |
+|---|---|---|---|---|---|
+| SOURCE_HOME_TILE_EVENTS | event_id | dbo.FactTileEngagement | EventId | `LTRIM(RTRIM(event_id))` | Unique event key |
+| SOURCE_HOME_TILE_EVENTS | user_id | dbo.FactTileEngagement | UserId | `NULLIF(LTRIM(RTRIM(user_id)), '')` | Optional identifier |
+| SOURCE_HOME_TILE_EVENTS | session_id | dbo.FactTileEngagement | SessionId | `NULLIF(LTRIM(RTRIM(session_id)), '')` | Session grouping |
+| SOURCE_HOME_TILE_EVENTS | event_ts | dbo.FactTileEngagement | EventTs | `CAST(event_ts AS DATETIME2(3))` | Event timestamp |
+| SOURCE_HOME_TILE_EVENTS | event_ts | dbo.FactTileEngagement | EventDateKey | `CONVERT(INT, CONVERT(CHAR(8), CAST(event_ts AS DATE), 112))` | YYYYMMDD key |
+| SOURCE_HOME_TILE_EVENTS | tile_id | dbo.FactTileEngagement | TileId | `LTRIM(RTRIM(tile_id))` | Join to tile metadata |
+| SOURCE_TILE_METADATA | tile_id | dbo.FactTileEngagement | TileKey | `dim.TileKey` | Lookup on `TileId` and `IsCurrent = 1` |
+| SOURCE_TILE_METADATA | tile_name | dbo.FactTileEngagement | TileName | `tm.TileName` | Enrichment field |
+| SOURCE_TILE_METADATA | tile_category | dbo.FactTileEngagement | TileCategory | `tm.TileCategory` | Enrichment field |
+| SOURCE_HOME_TILE_EVENTS | device_type | dbo.FactTileEngagement | DeviceType | `NULLIF(LTRIM(RTRIM(device_type)), '')` | Device normalization |
+| SOURCE_HOME_TILE_EVENTS | app_version | dbo.FactTileEngagement | AppVersion | `NULLIF(LTRIM(RTRIM(app_version)), '')` | Application version |
+| SOURCE_HOME_TILE_EVENTS | event_type | dbo.FactTileEngagement | TileViewCount | `CASE WHEN UPPER(LTRIM(RTRIM(event_type))) = 'TILE_VIEW' THEN 1 ELSE 0 END` | Derived measure |
+| SOURCE_HOME_TILE_EVENTS | event_type | dbo.FactTileEngagement | TileClickCount | `CASE WHEN UPPER(LTRIM(RTRIM(event_type))) = 'TILE_CLICK' THEN 1 ELSE 0 END` | Derived measure |
+| N/A | N/A | dbo.FactTileEngagement | InterstitialViewCount | `0` | Not populated by home tile events |
+| N/A | N/A | dbo.FactTileEngagement | PrimaryButtonClickCount | `0` | Not populated by home tile events |
+| N/A | N/A | dbo.FactTileEngagement | SecondaryButtonClickCount | `0` | Not populated by home tile events |
+
+### 4. Mapping Table for `FactTileEngagement` from Interstitial Events
+
+| Source Table | Source Column | Target Table | Target Column | Transformation Rule (T-SQL) | Notes |
+|---|---|---|---|---|---|
+| SOURCE_INTERSTITIAL_EVENTS | event_id | dbo.FactTileEngagement | EventId | `LTRIM(RTRIM(event_id))` | Unique event key |
+| SOURCE_INTERSTITIAL_EVENTS | user_id | dbo.FactTileEngagement | UserId | `NULLIF(LTRIM(RTRIM(user_id)), '')` | Optional identifier |
+| SOURCE_INTERSTITIAL_EVENTS | session_id | dbo.FactTileEngagement | SessionId | `NULLIF(LTRIM(RTRIM(session_id)), '')` | Session grouping |
+| SOURCE_INTERSTITIAL_EVENTS | event_ts | dbo.FactTileEngagement | EventTs | `CAST(event_ts AS DATETIME2(3))` | Event timestamp |
+| SOURCE_INTERSTITIAL_EVENTS | event_ts | dbo.FactTileEngagement | EventDateKey | `CONVERT(INT, CONVERT(CHAR(8), CAST(event_ts AS DATE), 112))` | YYYYMMDD key |
+| SOURCE_INTERSTITIAL_EVENTS | tile_id | dbo.FactTileEngagement | TileId | `LTRIM(RTRIM(tile_id))` | Join to tile metadata |
+| SOURCE_TILE_METADATA | tile_id | dbo.FactTileEngagement | TileKey | `dim.TileKey` | Lookup on `TileId` and `IsCurrent = 1` |
+| SOURCE_TILE_METADATA | tile_name | dbo.FactTileEngagement | TileName | `tm.TileName` | Enrichment field |
+| SOURCE_TILE_METADATA | tile_category | dbo.FactTileEngagement | TileCategory | `tm.TileCategory` | Enrichment field |
+| N/A | N/A | dbo.FactTileEngagement | DeviceType | `NULL` | Not provided in source |
+| N/A | N/A | dbo.FactTileEngagement | AppVersion | `NULL` | Not provided in source |
+| N/A | N/A | dbo.FactTileEngagement | TileViewCount | `0` | Not populated by interstitial events |
+| N/A | N/A | dbo.FactTileEngagement | TileClickCount | `0` | Not populated by interstitial events |
+| SOURCE_INTERSTITIAL_EVENTS | interstitial_view_flag | dbo.FactTileEngagement | InterstitialViewCount | `CASE WHEN ISNULL(interstitial_view_flag, 0) = 1 THEN 1 ELSE 0 END` | Derived measure |
+| SOURCE_INTERSTITIAL_EVENTS | primary_button_click_flag | dbo.FactTileEngagement | PrimaryButtonClickCount | `CASE WHEN ISNULL(primary_button_click_flag, 0) = 1 THEN 1 ELSE 0 END` | Derived measure |
+| SOURCE_INTERSTITIAL_EVENTS | secondary_button_click_flag | dbo.FactTileEngagement | SecondaryButtonClickCount | `CASE WHEN ISNULL(secondary_button_click_flag, 0) = 1 THEN 1 ELSE 0 END` | Derived measure |
+
+### 5. Consolidated Transformation Logic
+```sql
+SELECT
+    src.EventId,
+    src.UserId,
+    src.SessionId,
+    src.EventTs,
+    CONVERT(INT, CONVERT(CHAR(8), CAST(src.EventTs AS DATE), 112)) AS EventDateKey,
+    src.TileId,
+    dim.TileKey,
+    tm.TileName,
+    tm.TileCategory,
+    src.DeviceType,
+    src.AppVersion,
+    src.TileViewCount,
+    src.TileClickCount,
+    src.InterstitialViewCount,
+    src.PrimaryButtonClickCount,
+    src.SecondaryButtonClickCount
+FROM
+(
+    SELECT
+        LTRIM(RTRIM(event_id)) AS EventId,
+        NULLIF(LTRIM(RTRIM(user_id)), '') AS UserId,
+        NULLIF(LTRIM(RTRIM(session_id)), '') AS SessionId,
+        CAST(event_ts AS DATETIME2(3)) AS EventTs,
+        LTRIM(RTRIM(tile_id)) AS TileId,
+        NULLIF(LTRIM(RTRIM(device_type)), '') AS DeviceType,
+        NULLIF(LTRIM(RTRIM(app_version)), '') AS AppVersion,
+        CASE WHEN UPPER(LTRIM(RTRIM(event_type))) = 'TILE_VIEW' THEN 1 ELSE 0 END AS TileViewCount,
+        CASE WHEN UPPER(LTRIM(RTRIM(event_type))) = 'TILE_CLICK' THEN 1 ELSE 0 END AS TileClickCount,
+        0 AS InterstitialViewCount,
+        0 AS PrimaryButtonClickCount,
+        0 AS SecondaryButtonClickCount
+    FROM stg.SourceHomeTileEvents
+
+    UNION ALL
+
+    SELECT
+        LTRIM(RTRIM(event_id)) AS EventId,
+        NULLIF(LTRIM(RTRIM(user_id)), '') AS UserId,
+        NULLIF(LTRIM(RTRIM(session_id)), '') AS SessionId,
+        CAST(event_ts AS DATETIME2(3)) AS EventTs,
+        LTRIM(RTRIM(tile_id)) AS TileId,
+        NULL AS DeviceType,
+        NULL AS AppVersion,
+        0 AS TileViewCount,
+        0 AS TileClickCount,
+        CASE WHEN ISNULL(interstitial_view_flag, 0) = 1 THEN 1 ELSE 0 END AS InterstitialViewCount,
+        CASE WHEN ISNULL(primary_button_click_flag, 0) = 1 THEN 1 ELSE 0 END AS PrimaryButtonClickCount,
+        CASE WHEN ISNULL(secondary_button_click_flag, 0) = 1 THEN 1 ELSE 0 END AS SecondaryButtonClickCount
+    FROM stg.SourceInterstitialEvents
+) src
+LEFT JOIN dbo.DimTile dim
+    ON src.TileId = dim.TileId
+   AND dim.IsCurrent = 1
+LEFT JOIN stg.SourceTileMetadata tm
+    ON src.TileId = tm.TileId;
+```
+
+## Assumptions and Constraints
+
+### Assumptions
+- Existing source and target data model documents were not separately available; proposals are based on the supplied DDL files.
+- The downstream warehouse supports SQL Server-style T-SQL for transformation and serving layers.
+- `event_id` is unique and stable for merge/upsert logic.
+- `tile_id` is the conformed business key linking event sources to metadata.
+- `SOURCE_TILE_METADATA` is the trusted descriptive source for tile name/category.
+
+### Constraints
+- JIRA story and Confluence context were not available in the repository path; business rules may need refinement after those files are provided.
+- `branch_operational_details.sql` cannot be mapped into the tile event domain without additional relationship definitions.
+- Delta/Lakehouse source definitions may require connector-specific ingestion before T-SQL processing.
+- Null or unknown tile metadata should not block fact ingestion, but should be logged for stewardship.
+
+### Data Governance and Security
+- Mask or restrict `user_id` if it is classified as sensitive under enterprise policy.
+- Ensure least-privilege access for staging and target schemas.
+- Add audit logging for load traceability and reconciliation.
+- Maintain retention and partition strategy on `EventTs` / `EventDateKey` for performance.
+
+## References
+- `Input/SourceDDL.sql`
+- `Input/SOURCE_TILE_METADATA.sql`
+- `Input/branch_operational_details.sql`
+- Missing at time of preparation:
+  - JIRA story file
+  - Confluence context file
+
+## Cost Estimation and Justification
+
+Pricing information for the active model is not available from the current environment, so an exact runtime cost cannot be calculated.
+
+### Token Usage
+- Input tokens: Not available from the current environment.
+- Output tokens: Not available from the current environment.
+- Model used: Not exposed in the current environment.
+- Pricing per input/output token: Not exposed in the current environment.
+
+### Cost Formula
+- Input Cost = `input_tokens * input_cost_per_token`
+- Output Cost = `output_tokens * output_cost_per_token`
+- Total Cost = `Input Cost + Output Cost`
+
+### Current Limitation
+Because token counts, model name, and token pricing are not provided by the execution environment or tool outputs, only the formula can be documented here. To compute the actual cost, capture:
+- exact model identifier,
+- total prompt/input token count,
+- total completion/output token count,
+- current pricing for that model.
