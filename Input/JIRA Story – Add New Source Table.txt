@@ -1,0 +1,117 @@
+JIRA Story – Add New Source Table & Extend Target Reporting Metrics
+
+Story ID: DATAENG-###
+
+Story Title: Add New Source Table SOURCE_TILE_METADATA and Extend Target Summary Table with Tile Category
+Business Request / Why This Change Is Needed
+
+Product Analytics has requested the addition of tile-level metadata to enrich reporting dashboards.
+Currently, all tile metrics (views, clicks, CTRs, interstitial interactions) are aggregated only at tile_id level with no business grouping.
+
+To enable better reporting and performance tracking at a functional level (e.g., Offers, Health Checks, Payments), the business wants to include Tile Category in the daily reporting outputs.
+
+This requires adding a new table:
+
+SOURCE_TILE_METADATA
+
+which contains the tile category, tile name, and business grouping.
+
+This table will allow business teams to:
+
+View performance metrics by category (e.g., "Personal Finance Tiles vs Health Tiles")
+
+Enable category-level CTR comparisons
+
+Support product managers tracking feature adoption
+
+Improve dashboard drilldowns in Power BI/Tableau
+
+Allow future segmentation (e.g., enable/disable tiles by category)
+
+Scope of Work
+✔️ Add new Delta source table
+
+analytics_db.SOURCE_TILE_METADATA
+
+✔️ Join this table with existing ETL pipeline
+
+To enrich the final output with tile_category.
+
+✔️ Modify target table
+
+Add new column:
+
+tile_category STRING COMMENT 'Functional category of the tile'
+
+✔️ Update ETL transformations
+
+Left join metadata on tile_id
+
+Ensure backward compatibility (default category = "UNKNOWN" if no mapping)
+
+Detailed Technical Tasks
+1. Create New Delta Table
+
+Add DDL for SOURCE_TILE_METADATA
+
+Add table to schema registry/catalog
+
+Insert sample metadata for testing
+
+2. Update ETL Stored Procedure / T-SQL Job
+
+Modify daily summary ETL
+
+3. Update Target Table Writing Logic
+
+Ensure tile_category is included in:
+
+select statement
+
+overwritePartition logic
+
+schema validation in unit tests
+
+4. Unit Testing
+
+Add test cases:
+
+Should enrich tile_category correctly
+
+Should default to "UNKNOWN" when no metadata exists
+
+Should load without schema drift errors
+
+Should maintain correct record counts
+
+5. Update Documentation
+
+Add metadata table description
+
+Update lineage diagrams
+
+Update data dictionary
+
+Update dashboard field descriptions
+
+Acceptance Criteria
+
+✔️ SOURCE_TILE_METADATA table is created in analytics_db
+✔️ ETL pipeline reads metadata table successfully
+✔️ tile_category is added to target table
+✔️ tile_category appears accurately in reporting outputs
+✔️ All unit and regression tests pass
+✔️ Pipeline runs successfully with no schema drift
+✔️ Backward compatibility maintained (no change to existing counts)
+
+Out of Scope
+
+❌ No changes to global KPI table
+❌ No changes to historical data backfill (unless business requests)
+❌ No dashboard UI updates (owned by BI team)
+
+Dependencies
+
+BI team to update dashboards once new column is available
+
+Product team to maintain metadata table entries

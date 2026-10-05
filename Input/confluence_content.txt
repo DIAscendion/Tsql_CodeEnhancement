@@ -1,0 +1,18 @@
+Title: | ETL Change - Integration of BRANCH_OPERATIONAL_DETAILS into BRANCH_SUMMARY_REPORT
+
+Background: | As part of regulatory reporting enhancements, we are incorporating metadata about branch operations (manager, region, last audit) into the core reporting layer. This is to ensure that audit trails and compliance checks include contextual metadata.
+
+Changes Introduced:
+
+Item | Description
+Source Table | BRANCH_OPERATIONAL_DETAILS (Oracle)
+Target Table | BRANCH_SUMMARY_REPORT (Databricks Delta)
+Columns Added | REGION, LAST_AUDIT_DATE
+ETL Change Summary | PySpark logic to join new table, conditionally populate
+Deployment Note | Requires full reload of BRANCH_SUMMARY_REPORT
+
+Data Mapping Example:
+
+Source Column | Target Column
+BRANCH_OPERATIONAL_DETAILS.REGION | BRANCH_SUMMARY_REPORT.REGION
+BRANCH_OPERATIONAL_DETAILS.LAST_AUDIT_DATE | BRANCH_SUMMARY_REPORT.LAST_AUDIT_DATE
